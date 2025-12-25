@@ -1,7 +1,7 @@
 import MidiPlayer from 'midi-player-js';
 import * as Tone from "tone";
 
-const FPS = 60;
+const FPS = 480;
 const SECONDS_PER_TICK = 0.001736;
 
 class Ball {
@@ -58,48 +58,92 @@ class Ball {
     adjust_velocity_to_note_timing(time_till_collision) {
         let previousNoteTime;
         try {
+            // Calculate time of the note that just played
             previousNoteTime = MIDI_ARRAY[this.noteCounter - 1].tick * SECONDS_PER_TICK;
         } catch (e) {
             previousNoteTime = 0;
         }
-        console.log("FYM", this.noteCounter, MIDI_ARRAY);
+
+        // Calculate time of the NEXT note
         const currNoteTime = MIDI_ARRAY[this.noteCounter].tick * SECONDS_PER_TICK;
-        console.log("THESE TWO NOTES: ", previousNoteTime, currNoteTime);
-        const time_between_notes = Math.abs(currNoteTime - previousNoteTime);
-        console.log("TIME BETWEEN NOTES: ", time_between_notes);
-        const factor_of_multiplication = time_between_notes == 0 ? 1 : time_till_collision / time_between_notes;
-        console.log("TTC", time_till_collision);
-        console.log("OLD VELOCITY: ", this.velX, this.velY)
-        this.velX = this.velX * factor_of_multiplication;
-        this.velY = this.velY * factor_of_multiplication;
-        console.log("NEW VELOCITY: ", this.velX, this.velY);
-        console.log("FOM", factor_of_multiplication);
-    }
+        
+        // Calculate the duration available for the ball to travel to the next wall
+        let time_between_notes = Math.abs(currNoteTime - previousNoteTime);
+        
+        // Safety: prevent division by zero or super-low values that cause infinite speed
+        if (time_between_notes < 0.05) {
+            time_between_notes = 0.1; 
+        }
+
+        // Factor = (How long it currently takes) / (How long it MUST take)
+        // Avoid NaN if prediction failed
+        const factor = isNaN(time_till_collision) || time_till_collision === 0 
+            ? 1 
+            : time_till_collision / time_between_notes;
+
+        // Apply the factor to current velocities
+        let newVelX = this.velX * factor;
+        let newVelY = this.velY * factor;
+
+        // --- SPEED CLAMPING (The "Anti-Ghosting" Logic) ---
+        // The ball must not move more than ~80% of a cell width per frame.
+        // Otherwise, it will "tunnel" through the wall before the check happens.
+        const maxSafePixelPerFrame = this.mazeRef.cellWidth * 0.8;
+        const maxSafeVelocity = maxSafePixelPerFrame * FPS;
+
+        const currentSpeed = Math.sqrt(newVelX ** 2 + newVelY ** 2);
+
+        if (currentSpeed > maxSafeVelocity) {
+            const reductionRatio = maxSafeVelocity / currentSpeed;
+            newVelX *= reductionRatio;
+            newVelY *= reductionRatio;
+            console.warn("Velocity capped to prevent wall-phasing");
+        }
+
+        // Minimum speed check to prevent the ball from stopping
+        const minSpeed = 50; 
+        if (currentSpeed < minSpeed) {
+            const boostRatio = minSpeed / (currentSpeed || 1);
+            newVelX *= boostRatio;
+            newVelY *= boostRatio;
+        }
+
+        this.velX = newVelX;
+        this.velY = newVelY;
+
+        console.log("ADJUSTED VELOCITY:", this.velX, this.velY, "FACTOR:", factor);
+}
     update() {
         const dt = 1 / FPS;
-        // this.velX += this.accel * dt;
-        // this.velY += this.accel * dt;
         this.prevPositionX = this.position["x"];
         this.prevPositionY = this.position["y"];
+        
         this.position["x"] += this.velX * dt;
         this.position["y"] += this.velY * dt;
-        const currentCellIndex = [Math.floor(this.position['x'] / this.mazeRef.cellWidth), Math.floor(this.position['y'] / this.mazeRef.cellHeight)];
-        // console.log("CURRENT CELL INDEX: ", currentCellIndex);
-        const cell = this.mazeRef.cells[currentCellIndex[0]][currentCellIndex[1]];
-        // this.predictNextCollision(cell);
-        // const time_till_collision = this.calculate_time_till_next_collision(cell);
-        // this.adjust_velocity_to_note_timing(time_till_collision);
-        // console.log("FUCK CELL: ", cell);
-        // this.predictNextCollision(cell);
-        if (cell.type == 'w') {
-            this.handleBoxCollision(cell, currentCellIndex);
+
+        const gridX = Math.floor(this.position['x'] / this.mazeRef.cellWidth);
+        const gridY = Math.floor(this.position['y'] / this.mazeRef.cellHeight);
+
+        // CHECK IF OUT OF BOUNDS
+        if (!this.mazeRef.cells[gridX] || !this.mazeRef.cells[gridX][gridY]) {
+            this.position["x"] = this.prevPositionX;
+            this.position["y"] = this.prevPositionY;
+            this.velX = -this.velX;
+            this.velY = -this.velY;
+            this.noteCounter++;
+        } else {
+            let cell = this.mazeRef.cells[gridX][gridY];
+            if (cell.type == 'w') {
+                this.handleBoxCollision(cell, [gridX, gridY]);
+            }
         }
+        
         this.drawBall();
-        // this.handleBoxCollision(null);
         setTimeout(() => this.update(), 1000/FPS);
     }
     predictNextCollision(cell) {
         console.log("CELL: ", cell);
+        console.log("CURRENT POSITION", this.position["x"], this.position["y"]);
         let currCell = cell;
         console.log(currCell.type);
         let currX = this.position["x"];
@@ -126,25 +170,39 @@ class Ball {
             currCell = this.mazeRef.cells[Math.floor(currX / this.mazeRef.cellWidth)][Math.floor(currY / this.mazeRef.cellHeight)];
         }
         const exact_point = this.predictExactPoint(currCell);
+        console.log("GOT EXACT POINT: ", exact_point);
+        console.log("CURRXY", currX, currY)
         this.time_till_next_collisition = this.calculate_time_till_next_collision(exact_point);
         console.log("TIME TILL NEXT COLLISION: ", this.time_till_next_collisition);
         // currCell holds the next cell
         this.colorWallWithRandomColor(currCell);
     }
     predictExactPoint(currCell) {
-        let x = this.position["x"];
-        let y = this.position["y"];
-        const rangeX = [currCell.x, currCell.x + currCell.width];
-        const rangeY = [currCell.y, currCell.y + currCell.height];
-        // while ((x < rangeX[0] || x > rangeX[1]) && (y < rangeY[0] || y > rangeY[1])) {
-        //     x += this.velX * 0.1;
-        //     y += this.velY * 0.1;
-        // }
-        while (x < rangeX[0] || x > rangeX[1]) x += this.velX * 0.1;
-        while (y < rangeY[0] || y > rangeY[1]) y += this.velY * 0.1;
-        this.cellColorContext.fillStyle = "red";
-        this.cellColorContext.fillRect(x - 25, y - 25, 50, 50); // Center the rect on the point
-        return {"x": x, "y": y};
+        const px = this.position.x;
+        const py = this.position.y;
+        const vx = this.velX;
+        const vy = this.velY;
+
+        let tx = Infinity;
+        let ty = Infinity;
+
+        // Time to hit the relevant face of the wall
+        if (vx > 0) tx = (currCell.left - px) / vx;
+        else if (vx < 0) tx = (currCell.right - px) / vx;
+
+        if (vy > 0) ty = (currCell.top - py) / vy;
+        else if (vy < 0) ty = (currCell.bottom - py) / vy;
+
+        // Pick the smallest POSITIVE time. 
+        // We use 0.001 to ignore the wall we are currently snapped to.
+        const t = Math.min(tx > 0.001 ? tx : Infinity, ty > 0.001 ? ty : Infinity);
+
+        if (t === Infinity) return { x: px, y: py };
+
+        return {
+            x: px + vx * t,
+            y: py + vy * t
+        };
     }
     calculate_time_till_next_collision(point_of_collision) {
         const distance_between_x = point_of_collision["x"] - this.position["x"];
@@ -158,6 +216,9 @@ class Ball {
         
         const time_till_collision = total_distance / total_velocity;
         
+        if (time_till_collision == 0) {
+            // print();
+        }
         console.log("Distance:", total_distance, "Velocity:", total_velocity, "Time:", time_till_collision);
         
         return time_till_collision;
@@ -165,7 +226,9 @@ class Ball {
     handleBoxCollision(cell, currentCellIndex) {
         //left-right 
         if (this.prevPositionX < cell.left && this.position["x"] >= cell.left) {
+            console.log("JUST COLLIDED: ", this.position["x"], this.position["y"]);
             this.velX = -this.velX;
+            this.position["x"] = cell.left - 0.1
             this.playNote();
             this.colorWallWithRandomColor(cell);
             console.log("FUCK");
@@ -176,7 +239,9 @@ class Ball {
             this.adjust_velocity_to_note_timing(this.time_till_next_collisition);
         }
         if (this.prevPositionX > cell.right && this.position["x"] <= cell.right) {
+            console.log("JUST COLLIDED: ", this.position["x"], this.position["y"]);
             this.velX = -this.velX;
+            this.position["x"] = cell.right + 0.1
             this.playNote();
             this.colorWallWithRandomColor(cell);
             console.log("FUCK");
@@ -188,7 +253,9 @@ class Ball {
         }
         //top-bottom
         if (this.prevPositionY < cell.top && this.position["y"] >= cell.top) {
+            console.log("JUST COLLIDED: ", this.position["x"], this.position["y"]);
             this.velY = -this.velY;
+            this.position["y"] = cell.top - 0.1;
             this.playNote();
             this.colorWallWithRandomColor(cell);
             console.log("FUCK");
@@ -199,7 +266,10 @@ class Ball {
             this.adjust_velocity_to_note_timing(this.time_till_next_collisition);
         }
         if (this.prevPositionY > cell.bottom && this.position["y"] <= cell.bottom) {
+            console.log("JUST COLLIDED: ", this.position["x"], this.position["y"]);
             this.velY = -this.velY;
+            //snap back
+            this.position["y"] = cell.bottom + 0.1;
             this.playNote();
             this.colorWallWithRandomColor(cell);
             console.log("FUCK");
